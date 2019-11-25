@@ -5,6 +5,7 @@
 # import libraries
 import requests
 import os
+import hashlib
 
 # dictionary with all the requests that we use
 class bf_rest:
@@ -21,17 +22,23 @@ class bf_rest:
         self.api_key = api_key
         self.api_secret = api_secret
         self.sessionToken = ""
+        self.tokenExpires = 0
+        self.expirationMargin = 0.75
         self.organization = ''
         self.urls = {
-            'init_session'    : 'https://api.blackfynn.io/account/api/session',
-            'get_datasets'    : 'https://api.blackfynn.io/datasets/',
-            'create_package'  : 'https://api.blackfynn.io/packages',
-            'get_packages'    : 'https://api.blackfynn.io/datasets/<DID>/packages',
-            'get_file'        : 'https://api.blackfynn.io/packages/<PID>/files/<FID>',
-            'upload_preview'  : 'https://api.blackfynn.io/upload/preview/organizations/<OID>',
-            'upload_chunk'    : 'https://api.blackfynn.io/upload/chunk/organizations/<OID>/id/<IID>',
-            'upload_complete' : 'https://api.blackfynn.io/upload/complete/organizations/<OID>/id/<IID>',
-            'upload_status'   : 'https://api.blackfynn.io/upload/status/organizations/<OID>/id/<IID>',
+            'init_session'            : 'https://api.blackfynn.io/account/api/session',
+            'get_datasets'            : 'https://api.blackfynn.io/datasets/',
+            'get_dataset'             : 'https://api.blackfynn.io/datasets/<DID>',
+            'create_dataset'          : 'https://api.blackfynn.io/datasets',
+            'set_dataset_description' : 'https://api.blackfynn.io/datasets/<DID>/readme',
+            'get_dataset_description' : 'https://api.blackfynn.io/datasets/<DID>/readme',
+            'create_package'          : 'https://api.blackfynn.io/packages',
+            'get_packages'            : 'https://api.blackfynn.io/datasets/<DID>/packages',
+            'get_file'                : 'https://api.blackfynn.io/packages/<PID>/files/<FID>',
+            'upload_preview'          : 'https://api.blackfynn.io/upload/preview/organizations/<OID>',
+            'upload_chunk'            : 'https://api.blackfynn.io/upload/chunk/organizations/<OID>/id/<IID>',
+            'upload_complete'         : 'https://api.blackfynn.io/upload/complete/organizations/<OID>/id/<IID>',
+            'upload_status'           : 'https://api.blackfynn.io/upload/status/organizations/<OID>/id/<IID>',
         }
         self.pageSize = 1000
         self.chunkSize = 5000000
@@ -55,7 +62,7 @@ class bf_rest:
         #
 
         # request new session
-        r = requests.post(
+        response = requests.post(
             self.urls['init_session'],
             json = {
                 'tokenId' : self.api_key,
@@ -63,9 +70,11 @@ class bf_rest:
             }
         )
         # save session token to be reused for all subsequent requests
-        self.sessionToken = r.json()['session_token']
-        self.organization = r.json()['organization']
-        return r
+        jsonResponse = response.json()
+        self.sessionToken = jsonResponse['session_token']
+        self.organization = jsonResponse['organization']
+        self.tokenExpires = jsonResponse['expires_in'] * self.expirationMargin
+        return response
 
 
     def getDatasets(self):
@@ -84,6 +93,120 @@ class bf_rest:
         )
         # returns the json format of the answer
         return response.json()
+
+
+    def getDataset(self,did):
+        """
+        return all the info regarding the dataset matching the dataset id passed
+
+        :param did: blackfynn id of the dataset required
+        :return: dictionary with all the info regarding the dataset requested
+        """
+
+        # url
+        url = self.urls['get_dataset'].replace('<DID>',did)
+
+        # execute request
+        response = requests.get(
+            url,
+            params={
+                'api_key' : self.sessionToken
+            }
+        )
+
+        # return json dictionary if successful, plain response if not
+        return response.json() if response.status_code == 200 else response.content
+    # end getDataset
+
+    def createDataset(self,name,subtitle,tags=[],contributors=[],processPackages=False):
+        """
+        Create a new dataset
+
+        :param name: name of the dataset
+        :param subtitle: subtitile (short description) of the dataset
+        :param description: description of the dataset (currently not used)
+        :param tags: list of tags. DEfault: []
+        :param contributors: list of contributor's names. Default: []
+        :param processPackages: if packages are processed automatically upon upload or not. Default: False
+        :return: dictionary with all the info regarding the dataset
+        """
+
+        # prepare url
+        url = self.urls['create_dataset']
+        # prepare body
+        payload = {
+            "name": name,
+            "description": subtitle,
+            "tags": tags,
+            "license": {},
+            "properties": [],
+            "status": {},
+            "contributors": contributors,
+            "automaticallyProcessPackages": processPackages }
+
+        response = requests.post(
+            url,
+            params={
+                'api_key': self.sessionToken
+            },
+            json=payload
+        )
+
+        return response
+    #end createDataset
+
+    def getDatasetDescription(self,did):
+        """
+        return dataset desscription
+
+        :param did: blackfynn dataset id
+        :return:  dataset description string
+        """
+
+        # define url
+        url = self.urls['get_dataset_description'].replace('<DID',did)
+
+        # execute requests
+        response = requests.get(
+            url,
+            params={
+                'api_key': self.sessionToken
+            }
+        )
+
+        # return true if successful. False otherwise
+        return response.content
+
+
+    def setDatasetDescription(self,did,description):
+        """
+        set dataset description
+
+        :param did: blackfynn dataset id
+        :param description: descripition string
+
+        :return: True if successful, False otherwise
+        """
+
+        # define url
+        url = self.urls['set_dataset_description'].replace('<DID>',did)
+
+        # prepare body with description
+        payload = {
+            "readme" : description
+        }
+
+        # execute requests
+        response = requests.put(
+            url,
+            params={
+                'api_key': self.sessionToken
+            },
+            json=payload
+        )
+
+        # return true if successful. False otherwise
+        return (response.status_code == 200)
 
 
     def _provide_visual(self,visual=False):
@@ -257,13 +380,14 @@ class bf_rest:
         # end with
     # end downloadFile
 
-    def uploadFile(self,cid,path,filename,oid=None):
+    def uploadFile(self,did,path,filename,cid=None,oid=None):
         """
         upload the local file to the blackfynn container with the specified name
 
-        :param cid: blackfynn id of the container  where the file should be saved
+        :param did: blackfynn id of the dataset where the file should be saved
         :param path: local path to the file being uploaded
         :param filename: file name on blackfynn
+        :param cid: blackfynn id of the collection where the file should be saved
         :param oid: blackfynn id of the organization. If not passed, it will used the organization id saved when session was initialized
 
         :return: dictionary containing the info provided by blackfynn when the upload has been complete
@@ -345,13 +469,16 @@ class bf_rest:
         # }
         #
         url = self.urls['upload_preview'].replace('<OID>',oid)
+        params = {
+            'append'        : False,
+            'datasetId'     : did,
+        }
+        if cid:
+            params['destinationId'] = cid
+
         preview_response = requests.post(
             url,
-            params={
-                'append'         : False,
-                'destinationId'  : datasetId,
-                'organizationId' : self.organization
-            },
+            params=params,
             headers={
                 'accept'         : 'application/json',
                 'Content-Type'   : 'application/json',
@@ -360,10 +487,10 @@ class bf_rest:
             json = {
                 'files': [
                     {
-                        'uploadId': 1,
-                        'fileName': filename,
-                        'size': os.path.getsize(path),
-                        'processing': False,
+                        'uploadId'   : 1,
+                        'fileName'   : filename,
+                        'size'       : os.path.getsize(path),
+                        'processing' : False,
                     }
                 ]
             }
@@ -377,10 +504,11 @@ class bf_rest:
 
         # extract some values that are useful
         preview = preview_response.json()
-        multipartId = preview['packages']['files'][0]['multipartUploadId']
-        chunkSize = preview['packages']['files'][0]['chunkedUpload']['chunkSize']
-        totalChunks = preview['packages']['files'][0]['chunkedUpload']['totalChunks']
-        importId = preview['packages']['importId']
+        preview_file = preview['packages'][0]['files'][0]
+        multipartId = preview_file['multipartUploadId']
+        chunkSize = preview_file['chunkedUpload']['chunkSize']
+        totalChunks = preview_file['chunkedUpload']['totalChunks']
+        importId = preview['packages'][0]['importId']
 
         # loop through the content and send all the chunks
         # POST
@@ -460,9 +588,7 @@ class bf_rest:
         # {"success":true,"error":null}
 
         # get url for chunked upload
-        url = self.urls['upload_chunk'].replace('OID',self.organization).replace('IID',importId)
-        # initialize the hashing function
-        hasher = hashlib.sha256();
+        url = self.urls['upload_chunk'].replace('<OID>',self.organization).replace('<IID>',importId)
         # open file in binary reading
         fh = open(path,'rb')
         fh.seek(0)
@@ -470,8 +596,6 @@ class bf_rest:
         for chunk in range(totalChunks):
             # read chunk
             content = fh.read(chunkSize)
-            # upadte hasher
-            hasher.update(content)
 
             # upload
             chunk_response = requests.post(
@@ -480,8 +604,8 @@ class bf_rest:
                     'filename'       : filename,
                     'multipartId'    : multipartId,
                     'chunkNumber'    : chunk,
-                    'chunkSize'      : length(content),
-                    'chunkChecksum'  : hasher.hexdigest()
+                    'chunkSize'      : len(content),
+                    'chunkChecksum'  : hashlib.sha256(content).hexdigest()
                 },
                 headers={
                     'Authorization'  : 'Bearer ' + self.sessionToken
@@ -490,6 +614,10 @@ class bf_rest:
             )
 
             # check results
+            # if it failed, return content
+            if chunk_response.status_code != 201:
+                return chunk_response.content
+            # end if
 
         #end for
 
@@ -556,7 +684,26 @@ class bf_rest:
         #  }
         # ]
 
+        # get url to complete upload
+        url = self.urls['upload_complete'].replace('<OID>',self.organization).replace('<IID>',importId)
+
+        # prepare parameters
+        params = {
+            'datasetId'     : did,
+        }
+        if cid:
+            params['destinationId'] = cid
+
+        complete_response = requests.post(
+            url,
+            params = params,
+            headers={
+                'Authorization': 'Bearer ' + self.sessionToken
+            },
+        )
+
         # return response
+        return complete_response.json() if complete_response.status_code == 200 else complete_response.content
 
     #end uploadFile
 
