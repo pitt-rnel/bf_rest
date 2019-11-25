@@ -6,6 +6,8 @@
 import requests
 import os
 import hashlib
+import threading
+import uuid
 
 # dictionary with all the requests that we use
 class bf_rest:
@@ -23,8 +25,12 @@ class bf_rest:
         self.api_secret = api_secret
         self.sessionToken = ""
         self.tokenExpires = 0
+        self.sessionValid = False
         self.expirationMargin = 0.75
+        self.currentOperationsCounter = 0
+        self.currentOperationsList = []
         self.organization = ''
+        self.lastResponse = None
         self.urls = {
             'init_session'            : 'https://api.blackfynn.io/account/api/session',
             'get_datasets'            : 'https://api.blackfynn.io/datasets/',
@@ -43,7 +49,18 @@ class bf_rest:
         self.pageSize = 1000
         self.chunkSize = 5000000
 
+        #
+        # instantiate the threading condition using by the initSession
+        # to notify all the users that the session token has been updated
+        self.sessionUpdatedCondition = threading.Condition()
+        #
+        # lock used to update how many operation are currently running
+        self.currentOperationsLock = threading.Lock()
+        # condition used to notify all the processes waiting for all current operations to finish
+        self.currentOperationsCondition = threading.Condition()
 
+
+    @property
     def initSession(self):
         """
         initiate the session with blackfynn web api using api key and secret
@@ -51,6 +68,13 @@ class bf_rest:
 
         :return: requestsResponse object
         """
+
+        # set sessionValid flag to false
+        self.sessionValid = False
+
+        # wait for all the current operations to be completed
+        self.waitForCurrentOperations()
+
         # curl command to create a session
         # curl 
         #   -X POST 
@@ -69,12 +93,78 @@ class bf_rest:
                 'secret' : self.api_secret,
             }
         )
+        self.lastResponse = response
         # save session token to be reused for all subsequent requests
         jsonResponse = response.json()
         self.sessionToken = jsonResponse['session_token']
         self.organization = jsonResponse['organization']
         self.tokenExpires = jsonResponse['expires_in'] * self.expirationMargin
+
+        # start time to re-init session
+        timer = threading.Timer(self.tokenExpires, self.initSession)
+        timer.start()
+
+        #
+        # notify every process waiting on init session
+        self.sessionUpdatedCondition.notify_all()
+
+        # return response
         return response
+
+
+    def waitForSessionUpdate(self,timeout=None):
+        """
+        waits for the session token to be updated or until the timeout expires
+
+        :return: True unless timeout expered
+        """
+        return self.sessionUpdatedCondition.wait(timeout)
+
+
+    def waitForCurrentOperations(self,timeout=None):
+        """
+        it waits until all the current operations are completed or until timeout expires
+
+        :return: TRue unless timeout expired
+        """
+        return self.currentOperationsCondition.wait(timeout)
+
+
+    def startOperation(self,name=str(uuid.uuid4())):
+        """
+        indicates hat we are starting an operation with blackfynn web api
+        Increment the counter and insert name in list
+
+        :param name:(optional) name of the operation
+        :return:
+        """
+        self.currentOperationsLock.acquire()
+        self.currentOperationsCounter += 1
+        self.currentOperationsList.append(name)
+        self.currentOperationsLock.release()
+
+        return name
+
+
+    def stopOperation(self, name):
+        """
+        indicates hat we are starting an operation with blackfynn web api
+        Increment the counter and insert name in list
+
+        :param name:(optional) name of the operation
+        :return:
+        """
+        if self.currentOperationsCounter > 0:
+            self.currentOperationsLock.acquire()
+            self.currentOperationsCounter -= 1
+            self.currentOperationsList.remove(name)
+            self.currentOperationsLock.release()
+        #end if
+
+        # notify all the threads that are waiting for current operations to finish
+        self.currentOperationsCondition.notify_all()
+
+        return self.currentOperationsCounter
 
 
     def getDatasets(self):
@@ -92,6 +182,7 @@ class bf_rest:
             }
         )
         # returns the json format of the answer
+        self.lastResponse = response
         return response.json()
 
 
@@ -115,8 +206,10 @@ class bf_rest:
         )
 
         # return json dictionary if successful, plain response if not
+        self.lastResponse = response
         return response.json() if response.status_code == 200 else response.content
     # end getDataset
+
 
     def createDataset(self,name,subtitle,tags=[],contributors=[],processPackages=False):
         """
@@ -152,8 +245,10 @@ class bf_rest:
             json=payload
         )
 
+        self.lastResponse = response
         return response
     #end createDataset
+
 
     def getDatasetDescription(self,did):
         """
@@ -175,6 +270,7 @@ class bf_rest:
         )
 
         # return true if successful. False otherwise
+        self.lastResponse = response
         return response.content
 
 
@@ -206,6 +302,7 @@ class bf_rest:
         )
 
         # return true if successful. False otherwise
+        self.lastResponse = response
         return (response.status_code == 200)
 
 
@@ -281,6 +378,7 @@ class bf_rest:
         )
 
         # return json dictionary if successful, plain response if not
+        self.lastResponse = response
         return response.json() if response.status_code == 201 else response.content
     # end createCollection
 
@@ -298,7 +396,7 @@ class bf_rest:
         # define get url
         url = self.urls['get_packages'].replace('<DID>',did)
         # place get request
-        r = requests.get(
+        rawResponse = requests.get(
             url,
             params = {
                 'pageSize' : self.pageSize,
@@ -307,7 +405,8 @@ class bf_rest:
             }
         )
         # extract response in json format
-        response = r.json();
+        self.lastResponse = rawResponse
+        response = rawResponse.json();
         # extract data from response
         data = response['packages']
         self._provide_visual(visual)
@@ -315,7 +414,7 @@ class bf_rest:
         # now we keep looping to get all the others
         while 'cursor' in response.keys():
             # place next request for next batch of packages
-            r = requests.get(
+            rawResponse = requests.get(
                 url,
                 params = {
                     'pageSize' : self.pageSize,
@@ -325,7 +424,8 @@ class bf_rest:
                 }
             )
             # extract response
-            response = r.json();
+            self.lastResponse = rawResponse
+            response = rawResponse.json()
             # append data
             data += response['packages']
             self._provide_visual(visual)
@@ -348,17 +448,19 @@ class bf_rest:
         # test retrieving a file
         url = self.urls['get_file'].replace('<PID>',pid).replace('<FID>',str(fid))
         # get url to the file
-        cr = requests.get(
+        rawResponse = requests.get(
             url,
             params = {
                 'api_key' : self.sessionToken,
             }
         )
+        self.lastResponse = rawResponse
         # get file content
-        fc = requests.get(cr.json()['url'])
+        fc = requests.get(rawResponse.json()['url'])
         # return content as it is
         return fc.content
     #end getFileContent
+
 
     def downloadFile(self,pid,fid,filename):
         """
@@ -476,7 +578,7 @@ class bf_rest:
         if cid:
             params['destinationId'] = cid
 
-        preview_response = requests.post(
+        previewResponse = requests.post(
             url,
             params=params,
             headers={
@@ -495,15 +597,16 @@ class bf_rest:
                 ]
             }
         )
+        self.lastResponse = previewResponse
 
         # check if request was successful
         # if it failed, return content
-        if preview_response.status_code != 201:
-            return preview_response.content
+        if previewResponse.status_code != 201:
+            return previewResponse.content
         #end if
 
         # extract some values that are useful
-        preview = preview_response.json()
+        preview = previewResponse.json()
         preview_file = preview['packages'][0]['files'][0]
         multipartId = preview_file['multipartUploadId']
         chunkSize = preview_file['chunkedUpload']['chunkSize']
@@ -598,7 +701,7 @@ class bf_rest:
             content = fh.read(chunkSize)
 
             # upload
-            chunk_response = requests.post(
+            chunkResponse = requests.post(
                 url,
                 params={
                     'filename'       : filename,
@@ -612,11 +715,12 @@ class bf_rest:
                 },
                 data = content
             )
+            self.lastResponse = chunkResponse
 
             # check results
             # if it failed, return content
-            if chunk_response.status_code != 201:
-                return chunk_response.content
+            if chunkResponse.status_code != 201:
+                return chunkResponse.content
             # end if
 
         #end for
@@ -694,16 +798,17 @@ class bf_rest:
         if cid:
             params['destinationId'] = cid
 
-        complete_response = requests.post(
+        completeResponse = requests.post(
             url,
             params = params,
             headers={
                 'Authorization': 'Bearer ' + self.sessionToken
             },
         )
+        self.lastResponse = completeResponse
 
         # return response
-        return complete_response.json() if complete_response.status_code == 200 else complete_response.content
+        return completeResponse.json() if completeResponse.status_code == 200 else completeResponse.content
 
     #end uploadFile
 
